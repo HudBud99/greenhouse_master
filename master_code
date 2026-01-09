@@ -1,129 +1,60 @@
 import time
-import os
-import sqlite3
 import board
 import busio
 import adafruit_dht
-from datetime import datetime
 from digitalio import DigitalInOut, Direction
 from adafruit_mcp3xxx.mcp3008 import MCP3008
 from adafruit_mcp3xxx.analog_in import AnalogIn
 
-# UI Libraries for the Remote Shell
-from rich.live import Live
-from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.console import Console
-
-# --- CONFIGURATION ---
-DRY_THRESHOLD = 20.0      # Trigger watering at 20% or lower
-WATERING_TIME = 5         # Fixed 5-second blast
-ACTIVE_ZONES = [0, 1, 2]  # Only your 3 current working solenoids
-VRY_DRY_V = 2.38          # Calibration from your testing
-VRY_WET_V = 1.2
-SOIL_CURVE = 0.4          # Math to linearize the sensor data
-
-# --- HARDWARE SETUP ---
+# --- SETUP ---
 spi = busio.SPI(clock=board.SCK, MISO=board.MISO, MOSI=board.MOSI)
 mcp0 = MCP3008(spi, DigitalInOut(board.CE0)) 
 mcp1 = MCP3008(spi, DigitalInOut(board.CE1)) 
 
-# Relay Pins: 2, 3, 4, 17, 27, 22, 10, 9
-RELAY_PINS = [board.D2, board.D3, board.D4, board.D17, board.D27, board.D22, board.D10, board.D9]
-solenoids = [DigitalInOut(p) for p in RELAY_PINS]
+# Solenoids 0, 1, 2
+TEST_PINS = [board.D2, board.D3, board.D4]
+solenoids = [DigitalInOut(p) for p in TEST_PINS]
 for s in solenoids:
     s.direction = Direction.OUTPUT
-    s.value = True # Start with Relays OFF (Solenoids Closed)
+    s.value = True # Start OFF
 
+# DHT22 Climate Sensors
 dht_in = adafruit_dht.DHT22(board.D18)
 dht_out = adafruit_dht.DHT22(board.D23)
 
-# --- DATABASE & FOLDERS ---
-if not os.path.exists('photos'): os.makedirs('photos')
-db = sqlite3.connect("greenhouse.db", check_same_thread=False)
-db.execute("CREATE TABLE IF NOT EXISTS logs (ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, sensor TEXT, val REAL, type TEXT)")
+print("--- STARTING FULL DIAGNOSTIC ---")
 
-# --- UTILITY FUNCTIONS ---
-logs = []
-def add_log(msg):
-    logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-    if len(logs) > 8: logs.pop(0)
+# 1. Relay "Click" Test
+for i, s in enumerate(solenoids):
+    print(f"Testing Solenoid {i}... (Check for LED and Click)")
+    s.value = False # ON
+    time.sleep(2)
+    s.value = True  # OFF
+    time.sleep(1)
 
-def get_moisture(mcp, channel):
-    try:
-        chan = AnalogIn(mcp, channel)
-        volts = chan.voltage
-        norm = max(0, min(1, (VRY_DRY_V - volts) / (VRY_DRY_V - VRY_WET_V)))
-        return round(100 * (norm ** SOIL_CURVE), 1)
-    except: return 0.0
-
-def handle_camera():
-    now = datetime.now()
-    latest_path = "photos/latest_view.jpg"
-    # Take 15-min update photo
-    os.system(f"rpicam-still -o {latest_path} --nopreview --immediate")
-    # Archive Noon Snapshot
-    if now.hour == 12 and now.minute < 15:
-        daily_path = f"photos/archive_{now.strftime('%Y-%m-%d')}_noon.jpg"
-        if not os.path.exists(daily_path):
-            os.system(f"cp {latest_path} {daily_path}")
-            add_log("Camera: Noon Archive Saved")
-
-# --- UI GENERATOR ---
-def make_ui(moistures, ti, hi, to, ho):
-    table = Table(title="🌿 Greenhouse Master Dashboard", expand=True, border_style="green")
-    table.add_column("Zone", justify="center", style="cyan")
-    table.add_column("Moisture", justify="center")
-    table.add_column("Aux Sensor", justify="center", style="magenta")
-    table.add_column("Moisture", justify="center")
-
-    for i in range(8):
-        m_main = moistures[i]
-        m_aux = moistures[i+8]
-        c_main = "bold red" if m_main <= DRY_THRESHOLD else "bold green" if i in ACTIVE_ZONES else "white"
-        table.add_row(f"Solenoid {i}", f"[{c_main}]{m_main}%[/]", f"Sensor {i+8}", f"{m_aux}%")
-
-    climate = f"INDOOR: {ti}°C | {hi}% RH      OUTDOOR: {to}°C | {ho}% RH"
-    
-    layout = Layout()
-    layout.split_column(
-        Layout(Panel(table), size=12),
-        Layout(Panel(climate, title="Climate Settings"), size=3),
-        Layout(Panel("\n".join(logs), title="Activity Log"))
-    )
-    return layout
-
-# --- MAIN LOOP ---
-console = Console()
-with Live(console=console, screen=True, auto_refresh=False) as live:
-    while True:
-        handle_camera()
-        
-        # Read Sensors
-        current_m = [get_moisture(mcp0, i) for i in range(8)] + [get_moisture(mcp1, i) for i in range(8)]
-        
-        ti, hi, to, ho = 0, 0, 0, 0
+# 2. Climate Sensor Test (3 Attempts)
+print("\n--- CLIMATE CHECK ---")
+for sensor, name in [(dht_in, "Indoor"), (dht_out, "Outdoor")]:
+    success = False
+    for attempt in range(3):
         try:
-            ti, hi = dht_in.temperature, dht_in.humidity
-            to, ho = dht_out.temperature, dht_out.humidity
-        except: pass
+            temp = sensor.temperature
+            hum = sensor.humidity
+            if temp is not None:
+                print(f"{name} Sensor: {temp}°C | {hum}% Humidity")
+                success = True
+                break
+        except RuntimeWarning:
+            pass # Common DHT error, just retry
+        time.sleep(2)
+    if not success:
+        print(f"{name} Sensor: FAILED to read (Check wiring to GPIO 18/23)")
 
-        # Fixed-Blast Watering Logic
-        for i in ACTIVE_ZONES:
-            m = current_m[i]
-            if m <= DRY_THRESHOLD:
-                add_log(f"Zone {i} at {m}%: Opening Valve...")
-                solenoids[i].value = False # POWER ON -> Valve OPENS
-                time.sleep(WATERING_TIME)
-                solenoids[i].value = True  # POWER OFF -> Valve CLOSES (NC)
-                
-                db.execute("INSERT INTO logs (sensor, val, type) VALUES (?, ?, 'fixed_blast')", (f"Zone_{i}", WATERING_TIME))
-                db.commit()
+# 3. Moisture Sensor Voltages
+print("\n--- MOISTURE CHECK ---")
+for i in range(8):
+    v0 = round(AnalogIn(mcp0, i).voltage, 2)
+    v1 = round(AnalogIn(mcp1, i).voltage, 2)
+    print(f"Ch {i}: {v0}V  |  Ch {i+8}: {v1}V")
 
-        # Update Dashboard
-        live.update(make_ui(current_m, ti, hi, to, ho))
-        live.refresh()
-        
-        # Wait for the next 15-minute beat
-        time.sleep(900)
+print("\nDIAGNOSTIC COMPLETE.")
