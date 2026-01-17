@@ -1,129 +1,113 @@
 import time
-import os
-import sqlite3
 import board
 import busio
-import adafruit_dht
-from datetime import datetime
-from digitalio import DigitalInOut, Direction
-from adafruit_mcp3xxx.mcp3008 import MCP3008
+import digitalio
+import adafruit_mcp3xxx.mcp3008 as MCP
 from adafruit_mcp3xxx.analog_in import AnalogIn
-
-# UI Libraries for the Remote Shell
+import adafruit_dht
 from rich.live import Live
 from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
 from rich.console import Console
+from datetime import datetime
 
 # --- CONFIGURATION ---
-DRY_THRESHOLD = 20.0      # Trigger watering at 20% or lower
-WATERING_TIME = 5         # Fixed 5-second blast
-ACTIVE_ZONES = [0, 1, 2]  # Only your 3 current working solenoids
-VRY_DRY_V = 2.38          # Calibration from your testing
-VRY_WET_V = 1.2
-SOIL_CURVE = 0.4          # Math to linearize the sensor data
+# Relay GPIO Pins (Add more as you get more wires/relays)
+RELAY_PINS = [2, 3, 4, 17, 27, 22] 
+# DHT22 Pins
+INDOOR_DHT_PIN = board.D18
+OUTDOOR_DHT_PIN = board.D23
 
 # --- HARDWARE SETUP ---
+console = Console()
 spi = busio.SPI(clock=board.SCK, MISO=board.MISO, MOSI=board.MOSI)
-mcp0 = MCP3008(spi, DigitalInOut(board.CE0)) 
-mcp1 = MCP3008(spi, DigitalInOut(board.CE1)) 
 
-# Relay Pins: 2, 3, 4, 17, 27, 22, 10, 9
-RELAY_PINS = [board.D2, board.D3, board.D4, board.D17, board.D27, board.D22, board.D10, board.D9]
-solenoids = [DigitalInOut(p) for p in RELAY_PINS]
-for s in solenoids:
-    s.direction = Direction.OUTPUT
-    s.value = True # Start with Relays OFF (Solenoids Closed)
+# Setup two MCP3008 chips
+cs1 = digitalio.DigitalInOut(board.D24) # CE0
+cs2 = digitalio.DigitalInOut(board.D26) # CE1
+mcp1 = MCP.MCP3008(spi, cs1)
+mcp2 = MCP.MCP3008(spi, cs2)
 
-dht_in = adafruit_dht.DHT22(board.D18)
-dht_out = adafruit_dht.DHT22(board.D23)
+# Initialize Relays
+relays = []
+for pin in RELAY_PINS:
+    r = digitalio.DigitalInOut(getattr(board, f"D{pin}"))
+    r.direction = digitalio.Direction.OUTPUT
+    r.value = True # Start OFF (High is OFF for most relay boards)
+    relays.append(r)
 
-# --- DATABASE & FOLDERS ---
-if not os.path.exists('photos'): os.makedirs('photos')
-db = sqlite3.connect("greenhouse.db", check_same_thread=False)
-db.execute("CREATE TABLE IF NOT EXISTS logs (ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, sensor TEXT, val REAL, type TEXT)")
+# Initialize DHT Sensors
+dht_in = adafruit_dht.DHT22(INDOOR_DHT_PIN)
+dht_out = adafruit_dht.DHT22(OUTDOOR_DHT_PIN)
 
-# --- UTILITY FUNCTIONS ---
-logs = []
-def add_log(msg):
-    logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-    if len(logs) > 8: logs.pop(0)
+# Data Tracking
+last_watered = ["Never"] * 16
+sensor_voltages = [0.0] * 16
 
-def get_moisture(mcp, channel):
-    try:
-        chan = AnalogIn(mcp, channel)
-        volts = chan.voltage
-        norm = max(0, min(1, (VRY_DRY_V - volts) / (VRY_DRY_V - VRY_WET_V)))
-        return round(100 * (norm ** SOIL_CURVE), 1)
-    except: return 0.0
-
-def handle_camera():
-    now = datetime.now()
-    latest_path = "photos/latest_view.jpg"
-    # Take 15-min update photo
-    os.system(f"rpicam-still -o {latest_path} --nopreview --immediate")
-    # Archive Noon Snapshot
-    if now.hour == 12 and now.minute < 15:
-        daily_path = f"photos/archive_{now.strftime('%Y-%m-%d')}_noon.jpg"
-        if not os.path.exists(daily_path):
-            os.system(f"cp {latest_path} {daily_path}")
-            add_log("Camera: Noon Archive Saved")
-
-# --- UI GENERATOR ---
-def make_ui(moistures, ti, hi, to, ho):
-    table = Table(title="🌿 Greenhouse Master Dashboard", expand=True, border_style="green")
-    table.add_column("Zone", justify="center", style="cyan")
-    table.add_column("Moisture", justify="center")
-    table.add_column("Aux Sensor", justify="center", style="magenta")
-    table.add_column("Moisture", justify="center")
-
+def get_all_voltages():
+    """Reads all 16 channels across both MCP3008 chips"""
     for i in range(8):
-        m_main = moistures[i]
-        m_aux = moistures[i+8]
-        c_main = "bold red" if m_main <= DRY_THRESHOLD else "bold green" if i in ACTIVE_ZONES else "white"
-        table.add_row(f"Solenoid {i}", f"[{c_main}]{m_main}%[/]", f"Sensor {i+8}", f"{m_aux}%")
+        # Chip 1 (Sensors 1-8)
+        sensor_voltages[i] = AnalogIn(mcp1, getattr(MCP, f"P{i}")).voltage
+        # Chip 2 (Sensors 9-16)
+        sensor_voltages[i+8] = AnalogIn(mcp2, getattr(MCP, f"P{i}")).voltage
 
-    climate = f"INDOOR: {ti}°C | {hi}% RH      OUTDOOR: {to}°C | {ho}% RH"
+def generate_table():
+    """Creates the Rich Dashboard Table"""
+    table = Table(title="🌱 Greenhouse Master Dashboard - v2.0", header_style="bold green")
     
-    layout = Layout()
-    layout.split_column(
-        Layout(Panel(table), size=12),
-        Layout(Panel(climate, title="Climate Settings"), size=3),
-        Layout(Panel("\n".join(logs), title="Activity Log"))
-    )
-    return layout
+    table.add_column("Sensor ID", justify="center", style="cyan")
+    table.add_column("Voltage (Raw)", justify="center", style="yellow")
+    table.add_column("Status", justify="center")
+    table.add_column("Last Watered", justify="center", style="magenta")
+
+    for i in range(16):
+        v = sensor_voltages[i]
+        
+        # Determine status color
+        if v < 0.5: status = "[red]DISCONNECTED[/red]"
+        elif v > 2.5: status = "[blue]WET[/blue]"
+        else: status = "[green]OK[/green]"
+        
+        # If it's one of your 11 wired sensors, show data, else show "Empty"
+        label = f"Sensor {i+1}"
+        if i >= 11:
+            label = f"[grey42]Sensor {i+1}[/grey42]"
+            v_str = "[grey42]--[/grey42]"
+            water_str = "[grey42]N/A[/grey42]"
+            status = "[grey42]NO WIRE[/grey42]"
+        else:
+            v_str = f"{v:.2f}V"
+            water_str = last_watered[i]
+
+        table.add_row(label, v_str, status, water_str)
+
+    return table
 
 # --- MAIN LOOP ---
-console = Console()
-with Live(console=console, screen=True, auto_refresh=False) as live:
+console.clear()
+with Live(generate_table(), refresh_per_second=1) as live:
     while True:
-        handle_camera()
-        
-        # Read Sensors
-        current_m = [get_moisture(mcp0, i) for i in range(8)] + [get_moisture(mcp1, i) for i in range(8)]
-        
-        ti, hi, to, ho = 0, 0, 0, 0
         try:
-            ti, hi = dht_in.temperature, dht_in.humidity
-            to, ho = dht_out.temperature, dht_out.humidity
-        except: pass
+            # 1. Update Voltages
+            get_all_voltages()
+            
+            # 2. Update Climate (Try/Except because DHT22s are finicky)
+            try:
+                temp_in = dht_in.temperature
+                hum_in = dht_in.humidity
+                climate_str = f"Indoor: {temp_in}°C | {hum_in}% RH"
+            except:
+                climate_str = "Indoor: Sensor Error"
 
-        # Fixed-Blast Watering Logic
-        for i in ACTIVE_ZONES:
-            m = current_m[i]
-            if m <= DRY_THRESHOLD:
-                add_log(f"Zone {i} at {m}%: Opening Valve...")
-                solenoids[i].value = False # POWER ON -> Valve OPENS
-                time.sleep(WATERING_TIME)
-                solenoids[i].value = True  # POWER OFF -> Valve CLOSES (NC)
-                
-                db.execute("INSERT INTO logs (sensor, val, type) VALUES (?, ?, 'fixed_blast')", (f"Zone_{i}", WATERING_TIME))
-                db.commit()
+            # 3. Simple Logic Example (If Sensor 1 < 1.5V, Click Relay 1)
+            # if sensor_voltages[0] < 1.5:
+            #     relays[0].value = False # ON
+            #     last_watered[0] = datetime.now().strftime("%H:%M:%S")
 
-        # Update Dashboard
-        live.update(make_ui(current_m, ti, hi, to, ho))
-        live.refresh()
-        
-        # Wait for the next 15-minute beat
-        time.sleep(900)
+            # Update the display
+            live.update(generate_table())
+            time.sleep(1)
+
+        except Exception as e:
+            # This prevents the whole script from crashing if a wire loose
+            pass
