@@ -1,113 +1,210 @@
 import time
+import datetime
+import threading
+import csv
+import os
+import shutil
 import board
 import busio
-import digitalio
+from digitalio import Direction, DigitalInOut
 import adafruit_mcp3xxx.mcp3008 as MCP
 from adafruit_mcp3xxx.analog_in import AnalogIn
+from adafruit_mcp230xx.mcp23017 import MCP23017
 import adafruit_dht
+
 from rich.live import Live
 from rich.table import Table
+from rich.layout import Layout
+from rich.panel import Panel
 from rich.console import Console
-from datetime import datetime
+from rich import box
 
 # --- CONFIGURATION ---
-# Relay GPIO Pins (Add more as you get more wires/relays)
-RELAY_PINS = [2, 3, 4, 17, 27, 22] 
-# DHT22 Pins
-INDOOR_DHT_PIN = board.D18
-OUTDOOR_DHT_PIN = board.D23
+WATER_DURATION = 5          
+SOIL_LOG = "logs/soil_data.csv"
+CLIMATE_LOG = "logs/climate_data.csv"
+IMG_LATEST = "static/latest.jpg"
+IMG_ARCHIVE_DIR = "static/archive"
 
 # --- HARDWARE SETUP ---
-console = Console()
+i2c = busio.I2C(board.SCL, board.SDA)
 spi = busio.SPI(clock=board.SCK, MISO=board.MISO, MOSI=board.MOSI)
 
-# Setup two MCP3008 chips
-cs1 = digitalio.DigitalInOut(board.D24) # CE0
-cs2 = digitalio.DigitalInOut(board.D26) # CE1
-mcp1 = MCP.MCP3008(spi, cs1)
-mcp2 = MCP.MCP3008(spi, cs2)
+mcp_relays = MCP23017(i2c)
+solenoids = [mcp_relays.get_pin(i) for i in range(16)]
+for s in solenoids: s.direction = Direction.OUTPUT; s.value = True
 
-# Initialize Relays
-relays = []
-for pin in RELAY_PINS:
-    r = digitalio.DigitalInOut(getattr(board, f"D{pin}"))
-    r.direction = digitalio.Direction.OUTPUT
-    r.value = True # Start OFF (High is OFF for most relay boards)
-    relays.append(r)
+cs0, cs1 = DigitalInOut(board.D8), DigitalInOut(board.D7)
+mcp_a, mcp_b = MCP.MCP3008(spi, cs0), MCP.MCP3008(spi, cs1)
+sensors = []
+for i in range(8): sensors.append(AnalogIn(mcp_a, getattr(MCP, f'P{i}')))
+for i in range(8): sensors.append(AnalogIn(mcp_b, getattr(MCP, f'P{i}')))
 
-# Initialize DHT Sensors
-dht_in = adafruit_dht.DHT22(INDOOR_DHT_PIN)
-dht_out = adafruit_dht.DHT22(OUTDOOR_DHT_PIN)
+dht_device = adafruit_dht.DHT22(board.D4)
 
-# Data Tracking
-last_watered = ["Never"] * 16
-sensor_voltages = [0.0] * 16
+# --- STATE ---
+state = {
+    "moisture_pct": [0] * 16, 
+    "moisture_raw": [0.0] * 16,
+    "trend": ["-"] * 16, 
+    "daily_count": [0] * 16,
+    "status": ["IDLE"] * 16, 
+    "temp": 0, "humid": 0,
+    "disk_free": "0%", 
+    "system_msg": "Booting..."
+}
+prev_moisture = [0] * 16 
 
-def get_all_voltages():
-    """Reads all 16 channels across both MCP3008 chips"""
-    for i in range(8):
-        # Chip 1 (Sensors 1-8)
-        sensor_voltages[i] = AnalogIn(mcp1, getattr(MCP, f"P{i}")).voltage
-        # Chip 2 (Sensors 9-16)
-        sensor_voltages[i+8] = AnalogIn(mcp2, getattr(MCP, f"P{i}")).voltage
-
-def generate_table():
-    """Creates the Rich Dashboard Table"""
-    table = Table(title="🌱 Greenhouse Master Dashboard - v2.0", header_style="bold green")
+# --- LINEAR MATH HELPER ---
+def get_moisture_pct(voltage):
+    # SIMPLE LINEAR MAPPING (No complex calibration yet)
+    # 0V = 100% (Wet)
+    # 3V = 0% (Dry)
     
-    table.add_column("Sensor ID", justify="center", style="cyan")
-    table.add_column("Voltage (Raw)", justify="center", style="yellow")
-    table.add_column("Status", justify="center")
-    table.add_column("Last Watered", justify="center", style="magenta")
+    # Invert the voltage (since low voltage is wet)
+    # If voltage is > 3.0, it's just 0%
+    if voltage >= 3.0:
+        return 0
+    elif voltage <= 0.0:
+        return 100
+    else:
+        # The math: (3.0 - Voltage) / 3.0 * 100
+        return int(((3.0 - voltage) / 3.0) * 100)
 
+def log_data():
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Climate Log
+    with open(CLIMATE_LOG, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if os.stat(CLIMATE_LOG).st_size == 0: writer.writerow(["Timestamp", "Temp", "Humid"])
+        writer.writerow([timestamp, state['temp'], state['humid']])
+
+    # Soil Log
+    with open(SOIL_LOG, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if os.stat(SOIL_LOG).st_size == 0:
+            writer.writerow(["Timestamp", *[f"P{i+1}_Pct" for i in range(16)], *[f"P{i+1}_Volts" for i in range(16)]])
+        writer.writerow([timestamp, *state['moisture_pct'], *state['moisture_raw']])
+
+def take_photo():
+    os.makedirs(IMG_ARCHIVE_DIR, exist_ok=True)
+    state['system_msg'] = "📸 Taking Photo..."
+    os.system(f"libcamera-still -o {IMG_LATEST} --width 1024 --height 768 -n -t 1")
+    
+    now = datetime.datetime.now()
+    if now.hour == 12 and now.minute < 15:
+        archive_name = f"{IMG_ARCHIVE_DIR}/{now.strftime('%Y-%m-%d')}_1200.jpg"
+        if not os.path.exists(archive_name):
+            shutil.copy(IMG_LATEST, archive_name)
+            state['system_msg'] = "💾 Photo Archived!"
+
+def water_plant(i):
+    state['status'][i] = "[blink red]WATERING[/]"
+    solenoids[i].value = False # ON
+    time.sleep(WATER_DURATION)
+    solenoids[i].value = True  # OFF
+    state['daily_count'][i] += 1
+    state['status'][i] = "[green]OK[/]"
+    time.sleep(1) 
+
+def update_sensors():
     for i in range(16):
-        v = sensor_voltages[i]
+        v = round(sensors[i].voltage, 3)
+        pct = get_moisture_pct(v) # Using the new simple linear math
         
-        # Determine status color
-        if v < 0.5: status = "[red]DISCONNECTED[/red]"
-        elif v > 2.5: status = "[blue]WET[/blue]"
-        else: status = "[green]OK[/green]"
+        # Trend
+        if pct > prev_moisture[i]: state['trend'][i] = "⬆"
+        elif pct < prev_moisture[i]: state['trend'][i] = "⬇"
+        else: state['trend'][i] = "-"
+        prev_moisture[i] = pct
         
-        # If it's one of your 11 wired sensors, show data, else show "Empty"
-        label = f"Sensor {i+1}"
-        if i >= 11:
-            label = f"[grey42]Sensor {i+1}[/grey42]"
-            v_str = "[grey42]--[/grey42]"
-            water_str = "[grey42]N/A[/grey42]"
-            status = "[grey42]NO WIRE[/grey42]"
-        else:
-            v_str = f"{v:.2f}V"
-            water_str = last_watered[i]
-
-        table.add_row(label, v_str, status, water_str)
-
-    return table
+        state['moisture_raw'][i] = v
+        state['moisture_pct'][i] = pct
 
 # --- MAIN LOOP ---
-console.clear()
-with Live(generate_table(), refresh_per_second=1) as live:
+def system_controller():
     while True:
-        try:
-            # 1. Update Voltages
-            get_all_voltages()
+        now = datetime.datetime.now()
+        
+        # Update Environment every loop
+        try: state['temp'] = dht_device.temperature; state['humid'] = dht_device.humidity
+        except: pass
+        
+        total, used, free = shutil.disk_usage("/")
+        state['disk_free'] = f"{(free // (2**30))} GB"
+
+        # --- TIME DEFINITIONS ---
+        is_night = (now.hour > 21 or (now.hour == 21 and now.minute >= 30)) or \
+                   (now.hour < 6 or (now.hour == 6 and now.minute < 30))
+        
+        is_morning_flush = (now.hour == 6 and 30 <= now.minute < 32)
+
+        # --- TASK 1: SENSOR CHECK & WATERING ---
+        is_check_time = (now.minute % 15 == 0) if not is_night else (now.minute == 0)
+
+        if is_morning_flush:
+            state['system_msg'] = "[bold yellow]☀️ MORNING FLUSH[/]"
+            update_sensors()
+            for i in range(16):
+                water_plant(i)
+            log_data()
+            time.sleep(60)
+
+        elif is_check_time:
+            state['system_msg'] = "🔍 Scanning..."
+            update_sensors()
             
-            # 2. Update Climate (Try/Except because DHT22s are finicky)
-            try:
-                temp_in = dht_in.temperature
-                hum_in = dht_in.humidity
-                climate_str = f"Indoor: {temp_in}°C | {hum_in}% RH"
-            except:
-                climate_str = "Indoor: Sensor Error"
+            if not is_night:
+                for i in range(16):
+                    # Uses the new Linear % for the threshold
+                    if state['moisture_pct'][i] < 30:
+                        water_plant(i)
+            
+            log_data()
+            state['system_msg'] = "Done. Waiting..."
+            time.sleep(60) 
 
-            # 3. Simple Logic Example (If Sensor 1 < 1.5V, Click Relay 1)
-            # if sensor_voltages[0] < 1.5:
-            #     relays[0].value = False # ON
-            #     last_watered[0] = datetime.now().strftime("%H:%M:%S")
+        # --- TASK 2: PHOTO (STAGGERED) ---
+        is_photo_time = (now.minute % 15 == 5)
+        
+        if not is_night and is_photo_time:
+            take_photo()
+            time.sleep(60)
 
-            # Update the display
-            live.update(generate_table())
-            time.sleep(1)
+        if now.hour == 0 and now.minute == 0:
+            state['daily_count'] = [0] * 16
+        
+        time.sleep(1) # The "Tick" - Low stress
 
-        except Exception as e:
-            # This prevents the whole script from crashing if a wire loose
-            pass
+# --- DASHBOARD ---
+def generate_layout():
+    layout = Layout()
+    header = Panel(
+        f"Temp: {state['temp']}C | Hum: {state['humid']}% | SD: {state['disk_free']}\n{state['system_msg']}",
+        title=f"🌿 GREENHOUSE OS | {datetime.datetime.now().strftime('%H:%M:%S')}", border_style="green"
+    )
+    
+    table = Table(box=box.SIMPLE)
+    table.add_column("ID", style="cyan")
+    table.add_column("Moisture %", justify="center") # New Column 1
+    table.add_column("Trend", justify="center")
+    table.add_column("Raw Volts", justify="center", style="dim") # New Column 2
+    table.add_column("Daily", justify="center")
+    table.add_column("Status", justify="center")
+
+    for i in range(16):
+        pct = state['moisture_pct'][i]
+        c = "red" if pct < 30 else "green"
+        table.add_row(f"#{i+1}", f"[{c}]{pct}%[/]", state['trend'][i], f"{state['moisture_raw'][i]}V", str(state['daily_count'][i]), state['status'][i])
+    
+    layout.split_column(Layout(header, size=4), Layout(table))
+    return layout
+
+if __name__ == "__main__":
+    t = threading.Thread(target=system_controller, daemon=True)
+    t.start()
+    Console().clear()
+    with Live(generate_layout(), refresh_per_second=2, screen=True) as live:
+        while True: live.update(generate_layout()); time.sleep(0.5)
